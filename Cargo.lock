@@ -483,6 +483,7 @@ version = "0.1.0"
 dependencies = [
  "pico-args",
  "pollster",
+ "thiserror",
  "wgpu",
  "winit",
 ]
