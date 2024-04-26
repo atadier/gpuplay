@@ -1,6 +1,8 @@
 use std::{
     borrow::Cow,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
+    sync::mpsc,
+    thread,
     time::{Duration, Instant},
 };
 
@@ -20,6 +22,7 @@ use winit::{
 };
 
 mod shader;
+mod watch;
 
 const WINDOW_TITLE: &'static str = "GPU Playground";
 const FPS_UPDATE_RATE: Duration = Duration::from_millis(200);
@@ -48,7 +51,7 @@ impl<'s> GraphicsContext<'s> {
         self.surface.configure(&self.device, &self.config);
     }
 
-    pub fn add_shader_module(&mut self, path: OsString) {
+    pub fn add_shader_module(&mut self, path: &OsStr) {
         let module = shader::load_shader(&path).expect("failed to load shader");
         let shader_module = self.device.create_shader_module(ShaderModuleDescriptor {
             label: Some(&String::from_utf8_lossy(path.as_encoded_bytes())),
@@ -185,7 +188,7 @@ fn graphics_draw(ctx: &mut GraphicsContext) {
     ctx.submit_frame(frame, commands);
 }
 
-fn create_shader_pipeline(ctx: &mut GraphicsContext, path: OsString) {
+fn create_shader_pipeline(ctx: &mut GraphicsContext, path: &OsStr) {
     ctx.add_shader_module(path);
 }
 
@@ -198,7 +201,11 @@ async fn run(shader_path: OsString) {
         .unwrap();
 
     let mut graphics_ctx = graphics_init(&window).await;
-    create_shader_pipeline(&mut graphics_ctx, shader_path);
+    create_shader_pipeline(&mut graphics_ctx, &shader_path);
+
+    let (tx, rx) = mpsc::channel();
+    let reload_path = shader_path.clone();
+    thread::spawn(move || watch::send_reload(reload_path, tx));
 
     let window_title = format!("{} - {}", WINDOW_TITLE, graphics_ctx.get_gpu_id());
     window.set_title(&window_title);
@@ -226,6 +233,14 @@ async fn run(shader_path: OsString) {
             },
             Event::AboutToWait => {
                 window.request_redraw();
+
+                match rx.try_recv() {
+                    Ok(watch::FileReloadNotification) => {
+                        println!("reloading shader module...");
+                        graphics_ctx.add_shader_module(&shader_path);
+                    }
+                    _ => (),
+                }
             }
             _ => (),
         })
