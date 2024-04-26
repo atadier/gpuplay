@@ -6,13 +6,16 @@ use std::{
     time::{Duration, Instant},
 };
 
+use buffer::{to_slice, BufferUniforms};
 use pico_args::Arguments;
 use wgpu::{
-    Adapter, CommandEncoder, CommandEncoderDescriptor, Device, DeviceDescriptor, Features,
-    FragmentState, Instance, InstanceDescriptor, Limits, MultisampleState,
-    PipelineLayoutDescriptor, PowerPreference, PrimitiveState, Queue, RenderPipeline,
-    RenderPipelineDescriptor, RequestAdapterOptionsBase, ShaderModule, ShaderModuleDescriptor,
-    Surface, SurfaceConfiguration, SurfaceTexture, TextureViewDescriptor, VertexState,
+    Adapter, BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor,
+    BindGroupLayoutEntry, BindingType, Buffer, BufferBindingType, BufferDescriptor, BufferUsages,
+    CommandEncoder, CommandEncoderDescriptor, Device, DeviceDescriptor, Features, FragmentState,
+    Instance, InstanceDescriptor, Limits, MultisampleState, PipelineLayoutDescriptor,
+    PowerPreference, PrimitiveState, Queue, RenderPipeline, RenderPipelineDescriptor,
+    RequestAdapterOptionsBase, ShaderModule, ShaderModuleDescriptor, ShaderStages, Surface,
+    SurfaceConfiguration, SurfaceTexture, TextureViewDescriptor, VertexState,
 };
 use winit::{
     dpi::PhysicalSize,
@@ -21,6 +24,7 @@ use winit::{
     window::{Window, WindowBuilder},
 };
 
+mod buffer;
 mod shader;
 mod watch;
 
@@ -33,12 +37,19 @@ struct GraphicsContext<'s> {
     surface: Surface<'s>,
     config: SurfaceConfiguration,
     queue: Queue,
-    pipeline: Option<RenderPipeline>,
+    vs_module: ShaderModule,
+    uniform: Buffer,
+    state: Option<GraphicsState>,
+}
+
+struct GraphicsState {
+    pipeline: RenderPipeline,
+    uniform_bind: BindGroup,
 }
 
 impl<'s> GraphicsContext<'s> {
-    pub fn pipeline(&self) -> &Option<RenderPipeline> {
-        &self.pipeline
+    pub fn state(&self) -> &Option<GraphicsState> {
+        &self.state
     }
 
     pub fn get_gpu_id(&self) -> String {
@@ -64,35 +75,64 @@ impl<'s> GraphicsContext<'s> {
         let surface_caps = self.surface.get_capabilities(&self.adapter);
         let format = surface_caps.formats[0];
 
+        let uniform_bind_layout =
+            self.device
+                .create_bind_group_layout(&BindGroupLayoutDescriptor {
+                    label: None,
+                    entries: &[BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: ShaderStages::FRAGMENT,
+                        ty: BindingType::Buffer {
+                            ty: BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    }],
+                });
+
+        let uniform_bind = self.device.create_bind_group(&BindGroupDescriptor {
+            label: None,
+            layout: &uniform_bind_layout,
+            entries: &[BindGroupEntry {
+                binding: 0,
+                resource: self.uniform.as_entire_binding(),
+            }],
+        });
+
         let pipeline_layout = self
             .device
             .create_pipeline_layout(&PipelineLayoutDescriptor {
                 label: None,
-                bind_group_layouts: &[],
+                bind_group_layouts: &[&uniform_bind_layout],
                 push_constant_ranges: &[],
             });
 
-        self.pipeline = Some(
-            self.device
-                .create_render_pipeline(&RenderPipelineDescriptor {
-                    label: None,
-                    layout: Some(&pipeline_layout),
-                    vertex: VertexState {
-                        module: &module,
-                        entry_point: "vs_main",
-                        buffers: &[],
-                    },
-                    fragment: Some(FragmentState {
-                        module: &module,
-                        entry_point: "fs_main",
-                        targets: &[Some(format.into())],
-                    }),
-                    depth_stencil: None,
-                    primitive: PrimitiveState::default(),
-                    multisample: MultisampleState::default(),
-                    multiview: None,
+        let pipeline = self
+            .device
+            .create_render_pipeline(&RenderPipelineDescriptor {
+                label: None,
+                layout: Some(&pipeline_layout),
+                vertex: VertexState {
+                    module: &self.vs_module,
+                    entry_point: "vs_main",
+                    buffers: &[],
+                },
+                fragment: Some(FragmentState {
+                    module: &module,
+                    entry_point: "main",
+                    targets: &[Some(format.into())],
                 }),
-        );
+                depth_stencil: None,
+                primitive: PrimitiveState::default(),
+                multisample: MultisampleState::default(),
+                multiview: None,
+            });
+
+        self.state = Some(GraphicsState {
+            pipeline,
+            uniform_bind,
+        });
     }
 
     pub fn begin_frame(&mut self) -> (SurfaceTexture, CommandEncoder) {
@@ -109,6 +149,11 @@ impl<'s> GraphicsContext<'s> {
     pub fn submit_frame(&mut self, frame: SurfaceTexture, commands: CommandEncoder) {
         self.queue.submit(Some(commands.finish()));
         frame.present();
+    }
+
+    pub fn write_uniforms(&mut self, uniforms: &BufferUniforms) {
+        self.queue
+            .write_buffer(&self.uniform, 0, unsafe { to_slice(uniforms) });
     }
 }
 
@@ -149,19 +194,34 @@ async fn graphics_init(window: &Window) -> GraphicsContext {
         .expect("failed to create graphics device");
     surface.configure(&device, &config);
 
+    let vs_module = device.create_shader_module(ShaderModuleDescriptor {
+        label: Some("vs_module"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/vert.wgsl").into()),
+    });
+
+    let uniform = device.create_buffer(&BufferDescriptor {
+        label: Some("uniform"),
+        size: std::mem::size_of::<BufferUniforms>() as u64,
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
     GraphicsContext {
         adapter,
         surface,
         config,
         device,
         queue,
-        pipeline: None,
+        vs_module,
+        uniform,
+        state: None,
     }
 }
 
-fn graphics_draw(ctx: &mut GraphicsContext) {
+fn graphics_draw(ctx: &mut GraphicsContext, uniforms: &BufferUniforms) {
     let (frame, mut commands) = ctx.begin_frame();
     let view = frame.texture.create_view(&TextureViewDescriptor::default());
+    ctx.write_uniforms(uniforms);
 
     {
         let mut render_pass = commands.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -179,8 +239,9 @@ fn graphics_draw(ctx: &mut GraphicsContext) {
             occlusion_query_set: None,
         });
 
-        if let Some(pipeline) = ctx.pipeline() {
-            render_pass.set_pipeline(pipeline);
+        if let Some(state) = ctx.state() {
+            render_pass.set_pipeline(&state.pipeline);
+            render_pass.set_bind_group(0, &state.uniform_bind, &[]);
         }
         render_pass.draw(0..3, 0..1);
     }
@@ -211,6 +272,8 @@ async fn run(shader_path: OsString) {
     window.set_title(&window_title);
 
     let window = &window;
+    let mut uniforms = BufferUniforms::default();
+    let mut start_time = Instant::now();
     let mut last_frame = Instant::now();
     let mut last_frame_update = Instant::now();
     event_loop.set_control_flow(ControlFlow::Poll);
@@ -220,7 +283,9 @@ async fn run(shader_path: OsString) {
                 WindowEvent::CloseRequested => elwt.exit(),
                 WindowEvent::Resized(size) => graphics_ctx.resize(size),
                 WindowEvent::RedrawRequested => {
-                    graphics_draw(&mut graphics_ctx);
+                    uniforms.time = start_time.elapsed().as_secs_f32();
+
+                    graphics_draw(&mut graphics_ctx, &uniforms);
 
                     if last_frame_update.elapsed() > FPS_UPDATE_RATE {
                         let fps = 1. / last_frame.elapsed().as_secs_f64();
@@ -238,6 +303,7 @@ async fn run(shader_path: OsString) {
                     Ok(watch::FileReloadNotification) => {
                         println!("reloading shader module...");
                         graphics_ctx.add_shader_module(&shader_path);
+                        start_time = Instant::now();
                     }
                     _ => (),
                 }

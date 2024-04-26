@@ -9,5 +9,5 @@ edition = "2021"
 pico-args = "0.5.0"
 pollster = "0.3.0"
 thiserror = "1.0.59"
-wgpu = { version = "0.19.4", features = ["naga-ir"] }
+wgpu = { version = "0.19.4", features = ["naga-ir", "glsl"] }
 winit = "0.29.15"
