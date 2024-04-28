@@ -17,14 +17,14 @@ pub fn load_shader<P: AsRef<Path>>(path: P) -> Result<Module, LoadShaderError> {
     let shader_content = String::from_utf8(shader_bytes).map_err(LoadShaderError::Encoding)?;
     let shader_prelude = match shader_extension {
         "wgsl" => include_str!("shaders/prelude.wgsl"),
-        "glsl" | "frag" => include_str!("shaders/prelude.glsl"),
+        "frag" => include_str!("shaders/prelude.frag"),
         _ => panic!("unable to identify shader language by file extension"),
     };
     let shader_source = format!("{shader_prelude}{shader_content}");
 
     match shader_extension {
         "wgsl" => wgsl::parse_str(&shader_source).map_err(LoadShaderError::ParseWgsl),
-        "glsl" | "frag" => {
+        "frag" => {
             let options = glsl::Options::from(ShaderStage::Fragment);
             glsl::Frontend::default()
                 .parse(&options, &shader_source)

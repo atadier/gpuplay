@@ -21,6 +21,7 @@ use winit::{
     dpi::PhysicalSize,
     event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
+    keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowBuilder},
 };
 
@@ -272,7 +273,10 @@ async fn run(shader_path: OsString) {
     window.set_title(&window_title);
 
     let window = &window;
+    let window_size = window.inner_size();
     let mut uniforms = BufferUniforms::default();
+    uniforms.resolution = [window_size.width as f32, window_size.height as f32, 1.];
+
     let mut start_time = Instant::now();
     let mut last_frame = Instant::now();
     let mut last_frame_update = Instant::now();
@@ -281,9 +285,14 @@ async fn run(shader_path: OsString) {
         .run(move |event, elwt| match event {
             Event::WindowEvent { event, .. } => match event {
                 WindowEvent::CloseRequested => elwt.exit(),
-                WindowEvent::Resized(size) => graphics_ctx.resize(size),
+                WindowEvent::Resized(size) => {
+                    uniforms.resolution = [size.width as f32, size.height as f32, 1.];
+                    graphics_ctx.resize(size);
+                }
                 WindowEvent::RedrawRequested => {
                     uniforms.time = start_time.elapsed().as_secs_f32();
+                    uniforms.delta_time = last_frame.elapsed().as_secs_f32();
+                    uniforms.frame += 1;
 
                     graphics_draw(&mut graphics_ctx, &uniforms);
 
@@ -293,6 +302,12 @@ async fn run(shader_path: OsString) {
                         last_frame_update = Instant::now();
                     }
                     last_frame = Instant::now();
+                }
+                WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed() => {
+                    match event.physical_key {
+                        PhysicalKey::Code(KeyCode::Escape) => elwt.exit(),
+                        _ => (),
+                    }
                 }
                 _ => (),
             },
@@ -304,6 +319,7 @@ async fn run(shader_path: OsString) {
                         println!("reloading shader module...");
                         graphics_ctx.add_shader_module(&shader_path);
                         start_time = Instant::now();
+                        uniforms.frame = 0;
                     }
                     _ => (),
                 }
