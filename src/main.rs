@@ -6,8 +6,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use buffer::{to_slice, BufferUniforms};
+use buffer::BufferUniforms;
+use encase::ShaderType;
+use mint::Vector3;
 use pico_args::Arguments;
+use shader::LoadShaderError;
 use wgpu::{
     Adapter, BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor,
     BindGroupLayoutEntry, BindingType, Buffer, BufferBindingType, BufferDescriptor, BufferUsages,
@@ -63,13 +66,14 @@ impl<'s> GraphicsContext<'s> {
         self.surface.configure(&self.device, &self.config);
     }
 
-    pub fn add_shader_module(&mut self, path: &OsStr) {
-        let module = shader::load_shader(&path).expect("failed to load shader");
+    pub fn add_shader_module(&mut self, path: &OsStr) -> Result<(), LoadShaderError> {
+        let module = shader::load_shader(&path)?;
         let shader_module = self.device.create_shader_module(ShaderModuleDescriptor {
             label: Some(&String::from_utf8_lossy(path.as_encoded_bytes())),
             source: wgpu::ShaderSource::Naga(Cow::Owned(module)),
         });
         self.build_pipeline_with_shader(&shader_module);
+        Ok(())
     }
 
     fn build_pipeline_with_shader(&mut self, module: &ShaderModule) {
@@ -153,8 +157,11 @@ impl<'s> GraphicsContext<'s> {
     }
 
     pub fn write_uniforms(&mut self, uniforms: &BufferUniforms) {
-        self.queue
-            .write_buffer(&self.uniform, 0, unsafe { to_slice(uniforms) });
+        self.queue.write_buffer(
+            &self.uniform,
+            0,
+            &uniforms.as_bytes().expect("failed to cast uniforms"),
+        );
     }
 }
 
@@ -202,7 +209,7 @@ async fn graphics_init(window: &Window) -> GraphicsContext {
 
     let uniform = device.create_buffer(&BufferDescriptor {
         label: Some("uniform"),
-        size: std::mem::size_of::<BufferUniforms>() as u64,
+        size: BufferUniforms::min_size().get(),
         usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -243,15 +250,19 @@ fn graphics_draw(ctx: &mut GraphicsContext, uniforms: &BufferUniforms) {
         if let Some(state) = ctx.state() {
             render_pass.set_pipeline(&state.pipeline);
             render_pass.set_bind_group(0, &state.uniform_bind, &[]);
+            render_pass.draw(0..3, 0..1);
         }
-        render_pass.draw(0..3, 0..1);
     }
 
     ctx.submit_frame(frame, commands);
 }
 
-fn create_shader_pipeline(ctx: &mut GraphicsContext, path: &OsStr) {
-    ctx.add_shader_module(path);
+fn create_shader_pipeline(ctx: &mut GraphicsContext, path: &OsStr) -> bool {
+    if let Err(e) = ctx.add_shader_module(&path) {
+        eprintln!("failed to load shader: {:?}", e);
+        return false;
+    }
+    true
 }
 
 async fn run(shader_path: OsString) {
@@ -275,7 +286,11 @@ async fn run(shader_path: OsString) {
     let window = &window;
     let window_size = window.inner_size();
     let mut uniforms = BufferUniforms::default();
-    uniforms.resolution = [window_size.width as f32, window_size.height as f32, 1.];
+    uniforms.resolution = Vector3 {
+        x: window_size.width as f32,
+        y: window_size.height as f32,
+        z: 1.,
+    };
 
     let mut start_time = Instant::now();
     let mut last_frame = Instant::now();
@@ -286,7 +301,8 @@ async fn run(shader_path: OsString) {
             Event::WindowEvent { event, .. } => match event {
                 WindowEvent::CloseRequested => elwt.exit(),
                 WindowEvent::Resized(size) => {
-                    uniforms.resolution = [size.width as f32, size.height as f32, 1.];
+                    uniforms.resolution.x = size.width as f32;
+                    uniforms.resolution.y = size.height as f32;
                     graphics_ctx.resize(size);
                 }
                 WindowEvent::RedrawRequested => {
@@ -317,9 +333,10 @@ async fn run(shader_path: OsString) {
                 match rx.try_recv() {
                     Ok(watch::FileReloadNotification) => {
                         println!("reloading shader module...");
-                        graphics_ctx.add_shader_module(&shader_path);
-                        start_time = Instant::now();
-                        uniforms.frame = 0;
+                        if create_shader_pipeline(&mut graphics_ctx, &shader_path) {
+                            start_time = Instant::now();
+                            uniforms.frame = 0;
+                        }
                     }
                     _ => (),
                 }

@@ -6,6 +6,8 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+encase = { version = "0.8.0", features = ["mint"] }
+mint = "0.5.9"
 pico-args = "0.5.0"
 pollster = "0.3.0"
 thiserror = "1.0.59"
