@@ -1,7 +1,7 @@
 use std::{
     borrow::Cow,
     ffi::{OsStr, OsString},
-    sync::mpsc,
+    sync::mpsc::{self, Sender},
     thread,
     time::{Duration, Instant},
 };
@@ -67,6 +67,7 @@ impl<'s> GraphicsContext<'s> {
     }
 
     pub fn add_shader_module(&mut self, path: &OsStr) -> Result<(), LoadShaderError> {
+        self.state = None;
         let module = shader::load_shader(&path)?;
         let shader_module = self.device.create_shader_module(ShaderModuleDescriptor {
             label: Some(&String::from_utf8_lossy(path.as_encoded_bytes())),
@@ -238,7 +239,7 @@ fn graphics_draw(ctx: &mut GraphicsContext, uniforms: &BufferUniforms) {
                 view: &view,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -257,6 +258,20 @@ fn graphics_draw(ctx: &mut GraphicsContext, uniforms: &BufferUniforms) {
     ctx.submit_frame(frame, commands);
 }
 
+fn select_shader_by_index(
+    ctx: &mut GraphicsContext,
+    shaders: &Vec<OsString>,
+    control_tx: &Sender<watch::FileReloadSetPath>,
+    index: usize,
+) {
+    let path = &shaders[index];
+    if create_shader_pipeline(ctx, path) {
+        control_tx
+            .send(watch::FileReloadSetPath(path.clone()))
+            .expect("failed to send message in control channel");
+    }
+}
+
 fn create_shader_pipeline(ctx: &mut GraphicsContext, path: &OsStr) -> bool {
     if let Err(e) = ctx.add_shader_module(&path) {
         eprintln!("failed to load shader: {:?}", e);
@@ -265,7 +280,7 @@ fn create_shader_pipeline(ctx: &mut GraphicsContext, path: &OsStr) -> bool {
     true
 }
 
-async fn run(shader_path: OsString) {
+async fn run(shader_paths: Vec<OsString>) {
     let event_loop = EventLoop::new().unwrap();
     let window = WindowBuilder::new()
         .with_title(WINDOW_TITLE)
@@ -274,11 +289,12 @@ async fn run(shader_path: OsString) {
         .unwrap();
 
     let mut graphics_ctx = graphics_init(&window).await;
-    create_shader_pipeline(&mut graphics_ctx, &shader_path);
+    let mut shader_index = 0;
 
-    let (tx, rx) = mpsc::channel();
-    let reload_path = shader_path.clone();
-    thread::spawn(move || watch::send_reload(reload_path, tx));
+    let (notify_tx, notify_rx) = mpsc::channel();
+    let (control_tx, control_rx) = mpsc::channel();
+    select_shader_by_index(&mut graphics_ctx, &shader_paths, &control_tx, shader_index);
+    thread::spawn(move || watch::send_reload(notify_tx, control_rx));
 
     let window_title = format!("{} - {}", WINDOW_TITLE, graphics_ctx.get_gpu_id());
     window.set_title(&window_title);
@@ -314,26 +330,51 @@ async fn run(shader_path: OsString) {
 
                     if last_frame_update.elapsed() > FPS_UPDATE_RATE {
                         let fps = 1. / last_frame.elapsed().as_secs_f64();
-                        window.set_title(&format!("{} - {:.0} FPS", window_title, fps));
+                        window.set_title(&format!(
+                            "{} - {} : {:.0} FPS",
+                            &shader_paths[shader_index].to_string_lossy(),
+                            window_title,
+                            fps
+                        ));
                         last_frame_update = Instant::now();
                     }
                     last_frame = Instant::now();
                 }
-                WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed() => {
-                    match event.physical_key {
-                        PhysicalKey::Code(KeyCode::Escape) => elwt.exit(),
-                        _ => (),
+                WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed() => match event
+                    .physical_key
+                {
+                    PhysicalKey::Code(KeyCode::Escape) => elwt.exit(),
+                    PhysicalKey::Code(KeyCode::ArrowLeft) => {
+                        shader_index = (shader_index + shader_paths.len() - 1) % shader_paths.len();
+                        last_frame_update = Instant::now() - FPS_UPDATE_RATE;
+                        select_shader_by_index(
+                            &mut graphics_ctx,
+                            &shader_paths,
+                            &control_tx,
+                            shader_index,
+                        );
                     }
-                }
+                    PhysicalKey::Code(KeyCode::ArrowRight) => {
+                        shader_index = (shader_index + 1) % shader_paths.len();
+                        last_frame_update = Instant::now() - FPS_UPDATE_RATE;
+                        select_shader_by_index(
+                            &mut graphics_ctx,
+                            &shader_paths,
+                            &control_tx,
+                            shader_index,
+                        );
+                    }
+                    _ => (),
+                },
                 _ => (),
             },
             Event::AboutToWait => {
                 window.request_redraw();
 
-                match rx.try_recv() {
+                match notify_rx.try_recv() {
                     Ok(watch::FileReloadNotification) => {
                         println!("reloading shader module...");
-                        if create_shader_pipeline(&mut graphics_ctx, &shader_path) {
+                        if create_shader_pipeline(&mut graphics_ctx, &shader_paths[shader_index]) {
                             start_time = Instant::now();
                             uniforms.frame = 0;
                         }
@@ -348,6 +389,14 @@ async fn run(shader_path: OsString) {
 
 fn main() {
     let mut args = Arguments::from_env();
-    let arg1: OsString = args.free_from_str().unwrap();
-    pollster::block_on(run(arg1))
+    let mut paths = Vec::new();
+
+    while let Some(path) = args.free_from_str().ok() {
+        paths.push(path);
+    }
+
+    if paths.len() < 1 {
+        eprintln!("missing argument: {} <shaders>", env!("CARGO_PKG_NAME"));
+    }
+    pollster::block_on(run(paths))
 }

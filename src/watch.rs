@@ -1,38 +1,53 @@
-use std::{ffi::OsString, fs::metadata, sync::mpsc::Sender, thread::sleep, time::Duration};
+use std::{
+    ffi::OsString,
+    fs::metadata,
+    sync::mpsc::{Receiver, Sender},
+    thread::sleep,
+    time::{Duration, SystemTime},
+};
 
 const RELOAD_INTERVAL: Duration = Duration::from_millis(500);
 
 pub struct FileReloadNotification;
 
-fn as_string(path: OsString) -> String {
-    path.into_string()
-        .unwrap_or_else(|s| String::from_utf8_lossy(s.as_encoded_bytes()).to_string())
-}
+pub struct FileReloadSetPath(pub OsString);
 
-pub fn send_reload(path: OsString, tx: Sender<FileReloadNotification>) {
-    let mut last_mtime = None;
+pub fn send_reload(tx: Sender<FileReloadNotification>, rx: Receiver<FileReloadSetPath>) {
+    let mut watching_path: Option<OsString> = None;
+    let mut last_mtime: Option<SystemTime> = None;
+
     loop {
         sleep(RELOAD_INTERVAL);
 
-        match metadata(&path) {
-            Ok(metadata) => {
-                let mtime_opt = metadata.modified();
-                if let Err(e) = mtime_opt {
-                    eprintln!("cannot stat file '{}': {}", as_string(path), e);
-                    return;
-                }
-                let mtime = mtime_opt.unwrap();
+        if let Some(ref path) = watching_path {
+            match metadata(&path) {
+                Ok(metadata) => {
+                    let mtime_opt = metadata.modified();
+                    if let Err(e) = mtime_opt {
+                        eprintln!("cannot stat file '{}': {}", path.to_string_lossy(), e);
+                        return;
+                    }
+                    let mtime = mtime_opt.unwrap();
 
-                if last_mtime.is_some_and(|last| mtime > last) {
-                    tx.send(FileReloadNotification)
-                        .expect("failed to send notification");
+                    if last_mtime.is_some_and(|last| mtime > last) {
+                        tx.send(FileReloadNotification)
+                            .expect("failed to send notification");
+                    }
+                    last_mtime = Some(mtime);
                 }
-                last_mtime = Some(mtime);
+                Err(e) => {
+                    eprintln!("cannot open file '{}': {}", path.to_string_lossy(), e);
+                    watching_path = None;
+                }
             }
-            Err(e) => {
-                eprintln!("cannot open file '{}': {}", as_string(path), e);
-                return;
+        }
+
+        match rx.try_recv() {
+            Ok(FileReloadSetPath(new_path)) => {
+                watching_path = Some(new_path);
+                last_mtime = None;
             }
+            _ => (),
         }
     }
 }
